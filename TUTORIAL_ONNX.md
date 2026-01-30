@@ -3,10 +3,6 @@
 
 This guide provides step-by-step instructions on how to convert a trained YourTTS model to the ONNX format and perform optimized inference.
 
-
-https://github.com/fred-dq/TTS-Onnx
-
-
 ## 1. Environment Setup
 
 To ensure compatibility with the Coqui TTS libraries and ONNX runtime, it is recommended to use **Python 3.9**.
@@ -105,11 +101,3 @@ The script will output performance metrics for each sentence processed:
 
 * **CUDA Errors:** Ensure that `onnxruntime-gpu` is installed and that your NVIDIA drivers are compatible with CUDA 11.8+.
 * **Path Errors:** Double-check that absolute paths are used in `config.json` for the `d_vector_file` to avoid "File Not Found" errors during model initialization.
-
-```
-
----
-
-Would you like me to add a section on how to calculate the average RTF across all generated samples at the end of the tutorial?
-
-```
