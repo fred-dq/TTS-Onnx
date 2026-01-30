@@ -1803,7 +1803,7 @@ class Vits(BaseTTS):
             )
         return Vits(new_config, ap, tokenizer, speaker_manager, language_manager)
 
-    def export_onnx(self, output_path: str = "coqui_vits.onnx", verbose: bool = True):
+    def export_onnx(self, output_path: str = "coqui_vits.onnx", verbose: bool = True, config=None):
         """Export model to ONNX format for inference
 
         Args:
@@ -1822,7 +1822,7 @@ class Vits(BaseTTS):
         self.disc = None
         self.eval()
 
-        def onnx_inference(text, text_lengths, scales, sid=None, langid=None):
+        def onnx_inference(text, text_lengths, scales, sid=None, d_vector=None):
             noise_scale = scales[0]
             length_scale = scales[1]
             noise_scale_dp = scales[2]
@@ -1833,9 +1833,9 @@ class Vits(BaseTTS):
                 text,
                 aux_input={
                     "x_lengths": text_lengths,
-                    "d_vectors": None,
+                    "d_vectors": d_vector,
                     "speaker_ids": sid,
-                    "language_ids": langid,
+                    "language_ids": None,
                     "durations": None,
                 },
             )["model_outputs"]
@@ -1898,7 +1898,7 @@ class Vits(BaseTTS):
             providers=providers,
         )
 
-    def inference_onnx(self, x, x_lengths=None, speaker_id=None, language_id=None):
+    def inference_onnx(self, x, x_lengths=None, speaker_id=None, language_id=None, d_vector=None):
         """ONNX inference"""
 
         if isinstance(x, torch.Tensor):
@@ -1913,7 +1913,7 @@ class Vits(BaseTTS):
             [self.inference_noise_scale, self.length_scale, self.inference_noise_scale_dp],
             dtype=np.float32,
         )
-        input_params = {"input": x, "input_lengths": x_lengths, "scales": scales}
+        input_params = {"input": x, "input_lengths": x_lengths, "scales": scales, "d_vector": d_vector}
         if not speaker_id is None:
             input_params["sid"] = torch.tensor([speaker_id]).cpu().numpy()
         if not language_id is None:
@@ -1925,6 +1925,149 @@ class Vits(BaseTTS):
         )
         return audio[0][0]
 
+    def export_onnx_to_gpu(self, output_path: str = "coqui_vits.onnx", verbose: bool = True, config=None):
+        """Export model to ONNX format for inference"""
+
+        # Mover modelo para GPU
+        self.to("cuda")
+
+        # Backup de valores
+        _forward = self.forward
+        disc = None
+        if hasattr(self, "disc"):
+            disc = self.disc
+        training = self.training
+
+        # Configurar modo de exportação
+        self.disc = None
+        self.eval()
+
+        def onnx_inference(text, text_lengths, scales, sid=None, d_vector=None):
+            self.noise_scale = scales[0]
+            self.length_scale = scales[1]
+            self.noise_scale_dp = scales[2]
+
+            return self.inference(
+                text,
+                aux_input={
+                    "x_lengths": text_lengths,
+                    "d_vectors": d_vector,
+                    "speaker_ids": sid,
+                    "language_ids": None,
+                    "durations": None,
+                },
+            )["model_outputs"]
+
+        self.forward = onnx_inference
+
+        # Criar entradas dummy na GPU
+        dummy_input_length = 100
+        sequences = torch.randint(low=0, high=2, size=(1, dummy_input_length), dtype=torch.long, device="cuda")
+        sequence_lengths = torch.LongTensor([sequences.size(1)]).to("cuda")
+        scales = torch.FloatTensor([self.inference_noise_scale, self.length_scale, self.inference_noise_scale_dp]).to("cuda")
+        dummy_input = (sequences, sequence_lengths, scales)
+
+        input_names = ["input", "input_lengths", "scales"]
+
+        if self.num_speakers > 0:
+            speaker_id = torch.LongTensor([0]).to("cuda")
+            dummy_input += (speaker_id,)
+            input_names.append("sid")
+
+        if hasattr(self, "num_languages") and self.num_languages > 0 and self.embedded_language_dim > 0:
+            language_id = torch.LongTensor([0]).to("cuda")
+            dummy_input += (language_id,)
+            input_names.append("langid")
+
+        if config.use_d_vector_file:
+            d_vector = self.speaker_manager.get_random_embedding()
+            d_vector = torch.tensor(d_vector).unsqueeze(0).to("cuda")
+            dummy_input += (d_vector,)
+            input_names.append("d_vector")
+
+        # Exportar para ONNX
+        torch.onnx.export(
+            model=self.to("cuda"),
+            args=dummy_input,
+            opset_version=15,
+            f=output_path,
+            verbose=verbose,
+            input_names=input_names,
+            output_names=["output"],
+            dynamic_axes={
+                "input": {0: "batch_size", 1: "phonemes"},
+                "input_lengths": {0: "batch_size"},
+                "output": {0: "batch_size", 1: "time1", 2: "time2"},
+            },
+        )
+
+        # Restaurar estado original
+        self.forward = _forward
+        if training:
+            self.train()
+        if not disc is None:
+            self.disc = disc
+
+
+    def inference_onnx_gpu(self, x, x_lengths=None, speaker_id=None, language_id=None, d_vector=None):
+        """ONNX inference using GPU"""
+
+        # Garantir que o modelo está na GPU
+        if "CUDAExecutionProvider" not in self.onnx_sess.get_providers():
+            raise RuntimeError("ONNX model is not using CUDA. Check execution providers.")
+
+        # Mover os dados para a GPU e converter para numpy
+        if isinstance(x, torch.Tensor):
+            x = x.detach().to("cuda").cpu().numpy()
+
+        if x_lengths is None:
+            x_lengths = np.array([x.shape[1]], dtype=np.int64)
+        elif isinstance(x_lengths, torch.Tensor):
+            x_lengths = x_lengths.detach().to("cuda").cpu().numpy()
+
+        scales = np.array(
+            [self.inference_noise_scale, self.length_scale, self.inference_noise_scale_dp],
+            dtype=np.float32,
+        )
+
+        # Criar dicionário de inputs
+        input_params = {
+            "input": x,
+            "input_lengths": x_lengths,
+            "scales": scales,
+        }
+
+        if d_vector is not None:
+            if isinstance(d_vector, torch.Tensor):
+                d_vector = d_vector.detach().to("cuda").cpu().numpy()
+            input_params["d_vector"] = d_vector
+
+        if speaker_id is not None:
+            input_params["sid"] = np.array([speaker_id], dtype=np.int64)
+
+        if language_id is not None:
+            input_params["langid"] = np.array([language_id], dtype=np.int64)
+
+        # Executar inferência na GPU
+        audio = self.onnx_sess.run(["output"], input_params)
+
+        return audio[0][0]
+        
+    def load_onnx_to_gpu(self, model_path: str):
+        import onnxruntime as ort
+
+        providers = [
+            "CUDAExecutionProvider"
+        ]
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 2  # Nível de log detalhado
+        sess_options.log_verbosity_level = 2  # Aumenta a verbosidade dos logs        
+        self.onnx_sess = ort.InferenceSession(
+            model_path,
+            sess_options=sess_options,
+            providers=providers,
+        )        
+        print(self.onnx_sess.get_providers())        
 
 ##################################
 # VITS CHARACTERS
