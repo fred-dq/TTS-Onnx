@@ -3,6 +3,10 @@
 
 This guide provides step-by-step instructions on how to convert a trained YourTTS model to the ONNX format and perform optimized inference.
 
+
+https://github.com/fred-dq/TTS-Onnx
+
+
 ## 1. Environment Setup
 
 To ensure compatibility with the Coqui TTS libraries and ONNX runtime, it is recommended to use **Python 3.9**.
